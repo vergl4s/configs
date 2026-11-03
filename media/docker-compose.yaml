@@ -1,0 +1,293 @@
+# =============================================================================
+# Self-hosted media stack
+#   - Init container creates the directory tree and pre-seeds qBittorrent
+#     (wg0 bind, save paths, LAN auth bypass) so first run is zero-click
+#   - Only qBittorrent + SABnzbd route through Gluetun (custom WireGuard)
+#   - FlareSolverr proxies Cloudflare-protected torrent trackers
+#   - Single shared /data root inside containers => hardlinks work
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # One-shot init: builds directory tree and pre-seeds qBittorrent config.
+  # Skips itself on subsequent runs via a marker file.
+  # ---------------------------------------------------------------------------
+  init:
+    image: alpine:3
+    container_name: mediastack-init
+    restart: "no"
+    volumes:
+      - ${FOLDER_FOR_MEDIA}:/data
+      - ${FOLDER_FOR_DATA}:/config
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        MARKER=/config/.mediastack-init-done
+        if [ -f "$$MARKER" ]; then
+          echo "Init already done; skipping."
+          exit 0
+        fi
+
+        echo "Creating directory tree under /data and /config..."
+        mkdir -p /data/torrents/complete /data/torrents/incomplete
+        mkdir -p /data/usenet/complete /data/usenet/incomplete
+        mkdir -p /data/media/movies /data/media/tv /data/media/music /data/media/books
+        for app in gluetun qbittorrent sabnzbd sonarr radarr prowlarr bazarr readarr jellyfin jellyseerr; do
+          mkdir -p /config/$$app
+        done
+
+        echo "Pre-seeding qBittorrent.conf (wg0 bind + save paths + LAN auth)..."
+        mkdir -p /config/qbittorrent/qBittorrent
+        CONF=/config/qbittorrent/qBittorrent/qBittorrent.conf
+        if [ ! -f "$$CONF" ]; then
+          cat > "$$CONF" <<'EOF'
+        [BitTorrent]
+        Session\DefaultSavePath=/data/torrents/complete/
+        Session\Interface=wg0
+        Session\InterfaceName=wg0
+        Session\Port=6881
+        Session\TempPath=/data/torrents/incomplete/
+        Session\TempPathEnabled=true
+
+        [Preferences]
+        WebUI\Address=*
+        WebUI\AuthSubnetWhitelist=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+        WebUI\AuthSubnetWhitelistEnabled=true
+        WebUI\LocalHostAuth=false
+        EOF
+        fi
+
+        echo "Setting ownership to ${PUID}:${PGID}..."
+        chown -R ${PUID}:${PGID} /data /config
+
+        touch "$$MARKER"
+        chown ${PUID}:${PGID} "$$MARKER"
+        echo "Init complete."
+
+  # ---------------------------------------------------------------------------
+  # VPN — qBittorrent and SABnzbd attach to this network namespace.
+  # All host port publishing for the download clients lives here.
+  # ---------------------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      # qBittorrent web UI
+      - "${QBITTORRENT_PORT}:${QBITTORRENT_PORT}"
+      # qBittorrent torrenting port
+      - "${QBITTORRENT_TORRENT_PORT}:${QBITTORRENT_TORRENT_PORT}/tcp"
+      - "${QBITTORRENT_TORRENT_PORT}:${QBITTORRENT_TORRENT_PORT}/udp"
+      # SABnzbd web UI (SAB listens on 8080 internally — keep host port aligned)
+      - "${SABNZBD_PORT}:${SABNZBD_PORT}"
+    environment:
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=wireguard
+      - VPN_ENDPOINT_IP=${VPN_ENDPOINT_IP}
+      - VPN_ENDPOINT_PORT=${VPN_ENDPOINT_PORT}
+      - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY}
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_PRESHARED_KEY=${WIREGUARD_PRESHARED_KEY}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+      - TZ=${TZ}
+    volumes:
+      - ${FOLDER_FOR_DATA}/gluetun:/gluetun
+    # Built-in healthcheck pings the VPN gateway directly — no external HTTP,
+    # so no ipinfo.io / Cloudflare rate-limiting flakiness.
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Download clients (network_mode = service:gluetun => kill switch enforced)
+  # ---------------------------------------------------------------------------
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=${QBITTORRENT_PORT}
+    volumes:
+      - ${FOLDER_FOR_DATA}/qbittorrent:/config
+      - ${FOLDER_FOR_MEDIA}:/data
+
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      gluetun:
+        condition: service_healthy
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${FOLDER_FOR_DATA}/sabnzbd:/config
+      - ${FOLDER_FOR_MEDIA}:/data
+
+  # ---------------------------------------------------------------------------
+  # Cloudflare bypass for torrent indexers (1337x, TorrentGalaxy, etc.)
+  # ---------------------------------------------------------------------------
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    ports:
+      - "${FLARESOLVERR_PORT}:8191"
+
+  # ---------------------------------------------------------------------------
+  # *arr apps (direct LAN access)
+  # ---------------------------------------------------------------------------
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${SONARR_PORT}:8989"
+    volumes:
+      - ${FOLDER_FOR_DATA}/sonarr:/config
+      - ${FOLDER_FOR_MEDIA}:/data
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${RADARR_PORT}:7878"
+    volumes:
+      - ${FOLDER_FOR_DATA}/radarr:/config
+      - ${FOLDER_FOR_MEDIA}:/data
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${PROWLARR_PORT}:9696"
+    volumes:
+      - ${FOLDER_FOR_DATA}/prowlarr:/config
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${BAZARR_PORT}:6767"
+    volumes:
+      - ${FOLDER_FOR_DATA}/bazarr:/config
+      - ${FOLDER_FOR_MEDIA}:/data
+
+  readarr:
+    # LinuxServer.io deprecated their Readarr image (no amd64 manifest).
+    # hotio maintains a working drop-in replacement with the same conventions.
+    image: ghcr.io/hotio/readarr:latest
+    container_name: readarr
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${READARR_PORT}:8787"
+    volumes:
+      - ${FOLDER_FOR_DATA}/readarr:/config
+      - ${FOLDER_FOR_MEDIA}:/data
+
+  # ---------------------------------------------------------------------------
+  # Media server + request UI
+  # ---------------------------------------------------------------------------
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    ports:
+      - "${JELLYFIN_PORT}:8096"
+    volumes:
+      - ${FOLDER_FOR_DATA}/jellyfin:/config
+      - ${FOLDER_FOR_MEDIA}:/data
+    # Uncomment if your host has an Intel/AMD iGPU for hardware transcoding:
+    # devices:
+    #   - /dev/dri:/dev/dri
+
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+    ports:
+      - "${JELLYSEERR_PORT}:5055"
+    volumes:
+      - ${FOLDER_FOR_DATA}/jellyseerr:/app/config

@@ -1,0 +1,204 @@
+# WireGuard + CoreDNS sinkhole + private DNS-over-TLS, in one file.
+#
+# Setup:
+#   1. Cloudflare DNS: add an A record  *.dns  -> this VPS's IP, proxy status "DNS only".
+#   2. Cloudflare API token: use the "Edit zone DNS" template, limit it to this one zone,
+#      and (optional) to this VPS's IP under "Client IP Address Filtering".
+#   3. cp .env.example .env, then fill in SERVERURL, PEERS, DOMAIN, CF_API_TOKEN and
+#      DOT_SECRET (`openssl rand -hex 12`). Your secret hostname is DOT_SECRET.DOMAIN;
+#      this is what you type into Android.
+#   4. chmod 600 .env                      # it contains your Cloudflare token
+#   5. docker rm -f wireguard && docker compose up -d
+#
+# Open to the internet: 443/udp (WireGuard) and 853/tcp (DNS-over-TLS, secret hostname only).
+# Plain DNS on port 53 is never published; only WireGuard peers can reach it.
+#
+# After editing the blocked list:  docker compose up -d --force-recreate coredns
+# If 172.30.53.0/24 clashes with another network, change every 172.30.53.x in this file.
+
+services:
+  wireguard:
+    image: linuxserver/wireguard
+    container_name: wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - SERVERURL=${SERVERURL:?set SERVERURL in .env}
+      - SERVERPORT=443
+      - PEERS=${PEERS:?set PEERS in .env}
+      - PEERDNS=172.30.53.53            # peers use CoreDNS below
+      - INTERNAL_SUBNET=10.15.15.0
+    volumes:
+      - /root/wireguard-config:/config
+      - /lib/modules:/lib/modules
+    ports:
+      - 443:51820/udp
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      - dns
+    restart: unless-stopped
+
+  # Gatekeeper: closes any connection on 853 that doesn't ask for the secret hostname,
+  # before it reaches CoreDNS. Passes the TLS through untouched.
+  haproxy:
+    image: haproxy:lts
+    configs:
+      - source: haproxy
+        target: /usr/local/etc/haproxy/haproxy.cfg
+    ports:
+      - 853:8853/tcp
+    networks:
+      dns:
+        ipv4_address: 172.30.53.54
+    depends_on:
+      - coredns
+    restart: unless-stopped
+
+  coredns:
+    image: coredns/coredns:latest       # pin a version once it works
+    command: ["-conf", "/Corefile"]
+    configs:
+      - source: corefile
+        target: /Corefile
+    volumes:
+      - certs:/certs:ro
+    networks:
+      dns:
+        ipv4_address: 172.30.53.53
+    depends_on:
+      certbot:
+        condition: service_healthy      # wait for the first certificate
+    restart: unless-stopped
+
+  certbot:
+    image: certbot/dns-cloudflare
+    environment:
+      - DOMAIN=${DOMAIN:?set DOMAIN in .env}
+      - CF_API_TOKEN=${CF_API_TOKEN:?set CF_API_TOKEN in .env}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        (umask 077; printf 'dns_cloudflare_api_token = %s\n' "$$CF_API_TOKEN" > /tmp/cloudflare.ini)
+        live="/etc/letsencrypt/live/dot"
+
+        # First run: get the wildcard certificate through Cloudflare's DNS.
+        if [ ! -f "$$live/fullchain.pem" ]; then
+          certbot certonly --dns-cloudflare --dns-cloudflare-credentials /tmp/cloudflare.ini \
+            --non-interactive --agree-tos --register-unsafely-without-email \
+            --cert-name dot -d "*.$$DOMAIN" \
+            || { echo "Certificate request failed; retrying in 15 minutes"; sleep 900; exit 1; }
+        fi
+
+        # Then: try to renew twice a day, and hand any new certificate to CoreDNS.
+        while true; do
+          certbot renew --quiet || echo "Renewal attempt failed; will retry"
+          hash="$$(sha256sum "$$live/fullchain.pem" | cut -c1-16)"
+          if [ ! -f "/certs/cert-$$hash.pem" ]; then
+            cp -L "$$live/fullchain.pem" "/certs/cert-$$hash.pem"
+            cp -L "$$live/privkey.pem" "/certs/key-$$hash.pem"
+            chown 65532:65532 "/certs/cert-$$hash.pem" "/certs/key-$$hash.pem"
+            chmod 600 "/certs/key-$$hash.pem"
+            echo "tls /certs/cert-$$hash.pem /certs/key-$$hash.pem" > /certs/tls.conf.new
+            mv /certs/tls.conf.new /certs/tls.conf
+            for f in /certs/*.pem; do
+              case "$$f" in *"-$$hash.pem") ;; *) rm -f "$$f" ;; esac
+            done
+            echo "Published certificate $$hash"
+          fi
+          sleep 43200
+        done
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certs:/certs
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /certs/tls.conf"]
+      interval: 10s
+      start_period: 2m
+    restart: unless-stopped
+
+networks:
+  dns:
+    ipam:
+      config:
+        - subnet: 172.30.53.0/24
+
+volumes:
+  letsencrypt:
+  certs:
+
+configs:
+  haproxy:
+    content: |
+      global
+          log stdout format raw local0
+
+      defaults
+          mode tcp
+          log global
+          option tcplog
+          timeout connect 5s
+          timeout client 5m
+          timeout server 5m
+
+      frontend dot
+          bind :8853
+          # Wait for the TLS hello, then drop anything not asking for the secret hostname.
+          tcp-request inspect-delay 5s
+          tcp-request content reject unless { req.ssl_sni -i ${DOT_SECRET:?set DOT_SECRET in .env}.${DOMAIN} }
+          default_backend coredns
+
+      backend coredns
+          server coredns 172.30.53.53:853
+
+  corefile:
+    content: |
+      # ---- Blocked sites ---------------------------------------------------------------
+      # Each domain listed blocks itself and all its subdomains (reddit.com covers
+      # www.reddit.com, old.reddit.com, ...), so list base domains only.
+      #
+      # To block a new site: add its domains to an existing block, or copy a block for a
+      # new group. Big sites often use several domains; your home Pi-hole's query log
+      # shows which ones a site looks up. Don't block shared CDNs (cloudfront.net,
+      # akamaihd.net, ...), as that breaks unrelated sites.
+      #
+      # Apply changes:  docker compose up -d --force-recreate coredns
+      # (Phones may keep a cached answer for a few minutes.)
+
+      (blocked) {
+          template ANY ANY {
+              rcode NXDOMAIN
+          }
+      }
+
+      reddit.com redd.it redditmedia.com redditstatic.com {
+          import blocked
+      }
+
+      # Example: remove the leading "# " on these three lines to block it.
+      # facebook.com fbcdn.net instagram.com {
+      #     import blocked
+      # }
+      # -----------------------------------------------------------------------------------
+
+      # Everything else is forwarded to Quad9 over TLS.
+      . {
+          forward . tls://9.9.9.9 tls://149.112.112.112 {
+              tls_servername dns.quad9.net
+          }
+          cache
+          errors
+      }
+
+      # DNS-over-TLS, reached only through haproxy. Hands queries to the server above.
+      # tls.conf is written by certbot; when it points at a new cert, reload picks it up.
+      tls://.:853 {
+          import /certs/tls.conf
+          forward . 127.0.0.1:53
+          reload
+      }
